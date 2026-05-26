@@ -6,6 +6,7 @@ import random
 import jiwer
 import subprocess
 import imageio_ffmpeg
+import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -28,16 +29,32 @@ SNR_LEVELS = [0, 5, 10, 15, 20]
 
 BASE_NOISE_AMPLITUDE = 0.3
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run Piper voice synthesis, noise mixing, Whisper transcription and WER/CER evaluation."
+    )
+
+    parser.add_argument(
+        "--voices",
+        nargs=2,
+        required=True,
+        help="Exactly two Piper voice names without .onnx, e.g. en_US-ryan-medium en_US-amy-medium"
+    )
+
+    return parser.parse_args()
+
+
+args = parse_args()
+
+SELECTED_VOICES = args.voices
+
 syn_config = SynthesisConfig(
     volume=0.5,  # half as loud
     length_scale=1.0, 
     #noise_scale=1.0, 
     #noise_w_scale=1.0, 
     #normalize_audio=False, 
-)
-
-# load the voice
-voice = PiperVoice.load(f"{VOICES_DIR}/en_US-ryan-medium.onnx")
+) 
 
 # load sentences from harvard_sentences
 with open(f"{DATA_DIR}/harvard_sentences.txt", "r", encoding="utf-8") as f:
@@ -51,25 +68,37 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 for file in OUTPUT_DIR.glob("*.wav"):
     file.unlink()
 
-speech_files = []
-speech_references = {}
+speech_items = []
 
-# synthesize each selected sentence and save as a wav file
-for index, sentence in enumerate(selected_sentences, start=1):
-    print(f"Synthesizing: {sentence}")
+# load each selected voice and synthesize speech for each selected sentence
+for voice_name in SELECTED_VOICES:
+    voice_path = VOICES_DIR / f"{voice_name}.onnx"
+    if not voice_path.exists():
+        raise FileNotFoundError(f"Voice file not found: {voice_path}")
 
-    filename = f"speech_{index:02d}.wav"
-    filepath = OUTPUT_DIR / filename
+    voice = PiperVoice.load(str(voice_path))
 
-    with wave.open(str(filepath), "wb") as wav_file:
-        voice.synthesize_wav(sentence, wav_file, syn_config=syn_config)
+    # synthesize speech for each selected sentence and save as WAV files
+    for index, sentence in enumerate(selected_sentences, start=1):
+        print(f"Synthesizing with {voice_name}: {sentence}")
 
-    speech_files.append(filepath)
-    speech_references[filepath.stem] = sentence
+        filename = f"{voice_name}_speech_{index:02d}.wav"
+        filepath = OUTPUT_DIR / filename
+
+        with wave.open(str(filepath), "wb") as wav_file:
+            voice.synthesize_wav(sentence, wav_file, syn_config=syn_config)
+
+        speech_items.append({
+            "file": filepath,
+            "speech_id": filepath.stem,
+            "voice_name": voice_name,
+            "reference": sentence,
+        }) 
 
 mixed_files = []
 
-for speech_file in speech_files:
+for speech_item in speech_items:
+    speech_file = speech_item["file"]
     for noise_type in NOISE_TYPES:
         for snr_db in SNR_LEVELS:
             noise_amplitude = BASE_NOISE_AMPLITUDE * (10 ** (-snr_db / 20))
@@ -107,7 +136,9 @@ for speech_file in speech_files:
 
             mixed_files.append({
                 "file": output_file,
-                "speech_id": speech_file.stem,
+                "speech_id": speech_item["speech_id"],
+                "voice_name": speech_item["voice_name"],
+                "reference": speech_item["reference"],
                 "noise_type": noise_type,
                 "snr_db": snr_db,
             })
@@ -125,10 +156,10 @@ whisper_model = whisper.load_model("small")
 results = []
 
 for item in mixed_files:
-    audio_file = item["file"]
     speech_id = item["speech_id"]
-
-    reference = speech_references[speech_id]
+    reference = item["reference"]
+    voice_name = item["voice_name"]
+    audio_file = item["file"]
 
     print(f"Transcribing: {audio_file}")
 
@@ -154,6 +185,7 @@ for item in mixed_files:
 
     results.append({
         "file": audio_file,
+        "voice_name": voice_name,
         "reference": reference,
         "hypothesis": hypothesis,
         "reference_norm": reference_norm,
@@ -179,6 +211,7 @@ results_csv = OUTPUT_DIR / "results.csv"
 with open(results_csv, "w", newline="", encoding="utf-8") as f:
     writer = csv.DictWriter(f, fieldnames=[
         "file",
+        "voice_name",
         "reference",
         "hypothesis",
         "reference_norm",
@@ -196,95 +229,104 @@ print(f"Saved results to {results_csv}")
 df = pd.DataFrame(results)
 
 
-# wer vs snr plot
-fig, ax = plt.subplots(figsize=(8, 5))
+def save_plots(df_sub, suffix, title_suffix):
+    # wer vs snr
+    fig, ax = plt.subplots(figsize=(8, 5))
 
-for noise_type in NOISE_TYPES:
-    subset = df[df["noise_type"] == noise_type].groupby("snr_db")["wer"].mean()
-    ax.plot(subset.index, subset.values * 100, marker="o", label=noise_type)
+    for noise_type in NOISE_TYPES:
+        subset = df_sub[df_sub["noise_type"] == noise_type].groupby("snr_db")["wer"].mean()
+        ax.plot(subset.index, subset.values * 100, marker="o", label=noise_type)
 
-ax.set_xlabel("SNR (dB)")
-ax.set_ylabel("WER (%)")
-ax.set_title("WER vs SNR by Noise Type")
-ax.set_xticks(SNR_LEVELS)
-ax.legend()
-ax.grid(True)
+    ax.set_xlabel("SNR (dB)")
+    ax.set_ylabel("WER (%)")
+    ax.set_title(f"WER vs SNR by Noise Type{title_suffix}")
+    ax.set_xticks(SNR_LEVELS)
+    ax.legend()
+    ax.grid(True)
 
-plt.tight_layout()
-plt.savefig(OUTPUT_DIR / "wer_vs_snr.png", dpi=150)
-plt.close()
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / f"wer_vs_snr{suffix}.png", dpi=150)
+    plt.close()
 
-print("Saved wer_vs_snr.png")
-
-
-# cer vs snr plot
-fig, ax = plt.subplots(figsize=(8, 5))
-
-for noise_type in NOISE_TYPES:
-    subset = df[df["noise_type"] == noise_type].groupby("snr_db")["cer"].mean()
-    ax.plot(subset.index, subset.values * 100, marker="o", label=noise_type)
-
-ax.set_xlabel("SNR (dB)")
-ax.set_ylabel("CER (%)")
-ax.set_title("CER vs SNR by Noise Type")
-ax.set_xticks(SNR_LEVELS)
-ax.legend()
-ax.grid(True)
-
-plt.tight_layout()
-plt.savefig(OUTPUT_DIR / "cer_vs_snr.png", dpi=150)
-plt.close()
-
-print("Saved cer_vs_snr.png")
+    print(f"Saved wer_vs_snr{suffix}.png")
 
 
-# wer heatmap (noise type × snr)
-fig, ax = plt.subplots(figsize=(8, 4))
+    # cer vs snr
+    fig, ax = plt.subplots(figsize=(8, 5))
 
-pivot = df.groupby(["noise_type", "snr_db"])["wer"].mean().unstack()
-im = ax.imshow(pivot.values, aspect="auto", cmap="RdYlGn_r", vmin=0, vmax=1)
+    for noise_type in NOISE_TYPES:
+        subset = df_sub[df_sub["noise_type"] == noise_type].groupby("snr_db")["cer"].mean()
+        ax.plot(subset.index, subset.values * 100, marker="o", label=noise_type)
 
-ax.set_xticks(range(len(pivot.columns)))
-ax.set_xticklabels(pivot.columns)
-ax.set_yticks(range(len(pivot.index)))
-ax.set_yticklabels(pivot.index)
-ax.set_xlabel("SNR (dB)")
-ax.set_ylabel("Noise Type")
-ax.set_title("WER Heatmap (Noise Type × SNR)")
+    ax.set_xlabel("SNR (dB)")
+    ax.set_ylabel("CER (%)")
+    ax.set_title(f"CER vs SNR by Noise Type{title_suffix}")
+    ax.set_xticks(SNR_LEVELS)
+    ax.legend()
+    ax.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / f"cer_vs_snr{suffix}.png", dpi=150)
+    plt.close()
+
+    print(f"Saved cer_vs_snr{suffix}.png")
 
 
-for i in range(len(pivot.index)):
-    for j in range(len(pivot.columns)):
-        ax.text(j, i, f"{pivot.values[i, j]:.2f}", ha="center", va="center", fontsize=9)
+    # wer heatmap
+    fig, ax = plt.subplots(figsize=(8, 4))
+    pivot = df_sub.groupby(["noise_type", "snr_db"])["wer"].mean().unstack()
+    im = ax.imshow(pivot.values, aspect="auto", cmap="RdYlGn_r", vmin=0, vmax=1)
 
-plt.colorbar(im, ax=ax, label="WER")
-plt.tight_layout()
-plt.savefig(OUTPUT_DIR / "wer_heatmap.png", dpi=150)
-plt.close()
+    ax.set_xticks(range(len(pivot.columns)))
+    ax.set_xticklabels(pivot.columns)
+    ax.set_yticks(range(len(pivot.index)))
+    ax.set_yticklabels(pivot.index)
+    ax.set_xlabel("SNR (dB)")
+    ax.set_ylabel("Noise Type")
+    ax.set_title(f"WER Heatmap (Noise Type × SNR){title_suffix}")
 
-print("Saved wer_heatmap.png")
+    for i in range(len(pivot.index)):
+        for j in range(len(pivot.columns)):
+            ax.text(j, i, f"{pivot.values[i, j]:.2f}", ha="center", va="center", fontsize=9)
 
-# cer heatmap (noise type × snr)
-fig, ax = plt.subplots(figsize=(8, 4))
+    plt.colorbar(im, ax=ax, label="WER")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / f"wer_heatmap{suffix}.png", dpi=150)
+    plt.close()
 
-pivot_cer = df.groupby(["noise_type", "snr_db"])["cer"].mean().unstack()
-im = ax.imshow(pivot_cer.values, aspect="auto", cmap="RdYlGn_r", vmin=0, vmax=1)
+    print(f"Saved wer_heatmap{suffix}.png")
 
-ax.set_xticks(range(len(pivot_cer.columns)))
-ax.set_xticklabels(pivot_cer.columns)
-ax.set_yticks(range(len(pivot_cer.index)))
-ax.set_yticklabels(pivot_cer.index)
-ax.set_xlabel("SNR (dB)")
-ax.set_ylabel("Noise Type")
-ax.set_title("CER Heatmap (Noise Type × SNR)")
 
-for i in range(len(pivot_cer.index)):
-    for j in range(len(pivot_cer.columns)):
-        ax.text(j, i, f"{pivot_cer.values[i, j]:.2f}", ha="center", va="center", fontsize=9)
+    # cer heatmap
+    fig, ax = plt.subplots(figsize=(8, 4))
+    pivot_cer = df_sub.groupby(["noise_type", "snr_db"])["cer"].mean().unstack()
+    im = ax.imshow(pivot_cer.values, aspect="auto", cmap="RdYlGn_r", vmin=0, vmax=1)
 
-plt.colorbar(im, ax=ax, label="CER")
-plt.tight_layout()
-plt.savefig(OUTPUT_DIR / "cer_heatmap.png", dpi=150)
-plt.close()
+    ax.set_xticks(range(len(pivot_cer.columns)))
+    ax.set_xticklabels(pivot_cer.columns)
+    ax.set_yticks(range(len(pivot_cer.index)))
+    ax.set_yticklabels(pivot_cer.index)
+    ax.set_xlabel("SNR (dB)")
+    ax.set_ylabel("Noise Type")
+    ax.set_title(f"CER Heatmap (Noise Type × SNR){title_suffix}")
 
-print("Saved cer_heatmap.png")
+    for i in range(len(pivot_cer.index)):
+        for j in range(len(pivot_cer.columns)):
+            ax.text(j, i, f"{pivot_cer.values[i, j]:.2f}", ha="center", va="center", fontsize=9)
+
+    plt.colorbar(im, ax=ax, label="CER")
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / f"cer_heatmap{suffix}.png", dpi=150)
+    plt.close()
+    
+    print(f"Saved cer_heatmap{suffix}.png")
+
+
+# overall charts (all voices combined)
+save_plots(df, "", "")
+
+# per-voice charts
+for voice_name in SELECTED_VOICES:
+    df_voice = df[df["voice_name"] == voice_name]
+    safe_name = voice_name.replace("/", "_")
+    save_plots(df_voice, f"_{safe_name}", f" – {voice_name}")
