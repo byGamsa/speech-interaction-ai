@@ -1,3 +1,4 @@
+import csv
 import os
 import re
 import wave
@@ -170,3 +171,21 @@ for result in results:
     print(f"CER: {result['cer']:.3f}")
     print("-" * 40)
 
+results_csv = OUTPUT_DIR / "results.csv"
+
+with open(results_csv, "w", newline="", encoding="utf-8") as f:
+    writer = csv.DictWriter(f, fieldnames=[
+        "file",
+        "reference",
+        "hypothesis",
+        "reference_norm",
+        "hypothesis_norm",
+        "noise_type",
+        "snr_db",
+        "wer",
+        "cer",
+    ])
+    writer.writeheader()
+    writer.writerows(results)
+
+print(f"Saved results to {results_csv}")
