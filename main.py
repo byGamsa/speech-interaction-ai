@@ -19,6 +19,10 @@ import whisper
 
 SENTENCES_COUNT = 10
 OUTPUT_DIR = Path("output")
+CHARTS_DIR = OUTPUT_DIR / "charts"
+WAV_DIR = OUTPUT_DIR / "wav"
+RESULTS_DIR = OUTPUT_DIR / "results"
+TMP_DIR = OUTPUT_DIR / "tmp"
 VOICES_DIR = Path("voices")
 DATA_DIR = Path("data")
 
@@ -63,9 +67,13 @@ with open(f"{DATA_DIR}/harvard_sentences.txt", "r", encoding="utf-8") as f:
 selected_sentences = random.sample(sentences, SENTENCES_COUNT)
 
 OUTPUT_DIR.mkdir(exist_ok=True)
+CHARTS_DIR.mkdir(exist_ok=True)
+WAV_DIR.mkdir(exist_ok=True)
+RESULTS_DIR.mkdir(exist_ok=True)
+TMP_DIR.mkdir(exist_ok=True)
 
-# clear the output directory
-for file in OUTPUT_DIR.glob("*.wav"):
+# clear the wav directory
+for file in WAV_DIR.glob("*.wav"):
     file.unlink()
 
 speech_items = []
@@ -83,7 +91,7 @@ for voice_name in SELECTED_VOICES:
         print(f"Synthesizing with {voice_name}: {sentence}")
 
         filename = f"{voice_name}_speech_{index:02d}.wav"
-        filepath = OUTPUT_DIR / filename
+        filepath = WAV_DIR / filename
 
         with wave.open(str(filepath), "wb") as wav_file:
             voice.synthesize_wav(sentence, wav_file, syn_config=syn_config)
@@ -102,7 +110,7 @@ for speech_item in speech_items:
     for noise_type in NOISE_TYPES:
         for snr_db in SNR_LEVELS:
             noise_amplitude = BASE_NOISE_AMPLITUDE * (10 ** (-snr_db / 20))
-            output_file = OUTPUT_DIR / f"{speech_file.stem}_{noise_type}_noise_snr_{snr_db}db.wav"
+            output_file = WAV_DIR / f"{speech_file.stem}_{noise_type}_noise_snr_{snr_db}db.wav"
 
             command = [
                 FFMPEG_BIN,
@@ -206,7 +214,7 @@ for result in results:
     print(f"CER: {result['cer']:.3f}")
     print("-" * 40)
 
-results_csv = OUTPUT_DIR / "results.csv"
+results_csv = RESULTS_DIR / "results.csv"
 
 with open(results_csv, "w", newline="", encoding="utf-8") as f:
     writer = csv.DictWriter(f, fieldnames=[
@@ -245,7 +253,7 @@ def save_plots(df_sub, suffix, title_suffix):
     ax.grid(True)
 
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / f"wer_vs_snr{suffix}.png", dpi=150)
+    plt.savefig(CHARTS_DIR / f"wer_vs_snr{suffix}.png", dpi=150)
     plt.close()
 
     print(f"Saved wer_vs_snr{suffix}.png")
@@ -266,7 +274,7 @@ def save_plots(df_sub, suffix, title_suffix):
     ax.grid(True)
 
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / f"cer_vs_snr{suffix}.png", dpi=150)
+    plt.savefig(CHARTS_DIR / f"cer_vs_snr{suffix}.png", dpi=150)
     plt.close()
 
     print(f"Saved cer_vs_snr{suffix}.png")
@@ -283,7 +291,7 @@ def save_plots(df_sub, suffix, title_suffix):
     ax.set_yticklabels(pivot.index)
     ax.set_xlabel("SNR (dB)")
     ax.set_ylabel("Noise Type")
-    ax.set_title(f"WER Heatmap (Noise Type × SNR){title_suffix}")
+    ax.set_title(f"WER Heatmap (Noise Type x SNR){title_suffix}")
 
     for i in range(len(pivot.index)):
         for j in range(len(pivot.columns)):
@@ -291,7 +299,7 @@ def save_plots(df_sub, suffix, title_suffix):
 
     plt.colorbar(im, ax=ax, label="WER")
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / f"wer_heatmap{suffix}.png", dpi=150)
+    plt.savefig(CHARTS_DIR / f"wer_heatmap{suffix}.png", dpi=150)
     plt.close()
 
     print(f"Saved wer_heatmap{suffix}.png")
@@ -308,7 +316,7 @@ def save_plots(df_sub, suffix, title_suffix):
     ax.set_yticklabels(pivot_cer.index)
     ax.set_xlabel("SNR (dB)")
     ax.set_ylabel("Noise Type")
-    ax.set_title(f"CER Heatmap (Noise Type × SNR){title_suffix}")
+    ax.set_title(f"CER Heatmap (Noise Type x SNR){title_suffix}")
 
     for i in range(len(pivot_cer.index)):
         for j in range(len(pivot_cer.columns)):
@@ -316,9 +324,9 @@ def save_plots(df_sub, suffix, title_suffix):
 
     plt.colorbar(im, ax=ax, label="CER")
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / f"cer_heatmap{suffix}.png", dpi=150)
+    plt.savefig(CHARTS_DIR / f"cer_heatmap{suffix}.png", dpi=150)
     plt.close()
-    
+
     print(f"Saved cer_heatmap{suffix}.png")
 
 
