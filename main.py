@@ -32,12 +32,19 @@ selected_sentences = random.sample(sentences, SENTENCES_COUNT)
 for file in OUTPUT_DIR.glob("*.wav"):
     file.unlink()
 
+speech_files = []
+
 # synthesize each selected sentence and save as a wav file
 for sentence in selected_sentences:
     print(f"Synthesizing: {sentence}")
-    
-    with wave.open(f'{OUTPUT_DIR}/{sentence[:10]}.wav', "wb") as wav_file:
+
+    filename = f'{sentence[:10]}.wav'
+    filepath = OUTPUT_DIR / filename
+
+    with wave.open(filepath, "wb") as wav_file:
         voice.synthesize_wav(sentence, wav_file, syn_config=syn_config)
+        
+    speech_files.append(filepath)
 
 def generate_white_noise(num_samples): 
     # generating white noise using a normal distribution
