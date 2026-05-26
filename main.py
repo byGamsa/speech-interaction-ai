@@ -1,15 +1,30 @@
+import os
+import re
 import wave
 import random
+import jiwer
 import numpy as np
+import subprocess
+import imageio_ffmpeg
 
 from pathlib import Path
 from piper import PiperVoice, SynthesisConfig
 from scipy.fft import rfft, irfft
+from scipy.io import wavfile
+import whisper
 
 SENTENCES_COUNT = 10
 OUTPUT_DIR = Path("output")
 VOICES_DIR = Path("voices")
 DATA_DIR = Path("data")
+
+FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe() 
+
+NOISE_TYPES = ["white", "pink", "blue"]
+SNR_DB = 10
+
+BASE_NOISE_AMPLITUDE = 0.3
+NOISE_AMPLITUDE = BASE_NOISE_AMPLITUDE * (10 ** (-SNR_DB / 20))
 
 syn_config = SynthesisConfig(
     volume=0.5,  # half as loud
@@ -28,78 +43,130 @@ with open(f"{DATA_DIR}/harvard_sentences.txt", "r", encoding="utf-8") as f:
 
 selected_sentences = random.sample(sentences, SENTENCES_COUNT)
 
+OUTPUT_DIR.mkdir(exist_ok=True)
+
 # clear the output directory
 for file in OUTPUT_DIR.glob("*.wav"):
     file.unlink()
 
 speech_files = []
+speech_references = {}
 
 # synthesize each selected sentence and save as a wav file
-for sentence in selected_sentences:
+for index, sentence in enumerate(selected_sentences, start=1):
     print(f"Synthesizing: {sentence}")
 
-    filename = f'{sentence[:10]}.wav'
+    filename = f"speech_{index:02d}.wav"
     filepath = OUTPUT_DIR / filename
 
-    with wave.open(filepath, "wb") as wav_file:
+    with wave.open(str(filepath), "wb") as wav_file:
         voice.synthesize_wav(sentence, wav_file, syn_config=syn_config)
-        
+
     speech_files.append(filepath)
+    speech_references[filepath.stem] = sentence
 
-def generate_white_noise(num_samples): 
-    # generating white noise using a normal distribution
-    noise_samples = np.random.normal(0, 0.5, num_samples) 
-    return noise_samples
+mixed_files = []
 
-def generate_pink_noise(num_samples):  
-    # generating pink noise using the Real Fast Fourier Transform (RFFT)
-    white_noise = np.random.normal(0, 1, num_samples)
+for speech_file in speech_files:
+    for noise_type in NOISE_TYPES:
+        output_file = OUTPUT_DIR / f"{speech_file.stem}_{noise_type}_noise_snr_{SNR_DB}db.wav"
 
-    X = rfft(white_noise)
- 
-    S = np.zeros_like(X)
-    freqs = np.fft.rfftfreq(num_samples, d=1/num_samples)
+        command = [
+            FFMPEG_BIN,
+            "-y",
+            "-i", str(speech_file),
+            "-filter_complex",
+            (
+                f"anoisesrc=color={noise_type}:sample_rate=16000:amplitude={NOISE_AMPLITUDE}[noise];"
+                f"[0:a][noise]amix=inputs=2:duration=first:dropout_transition=0,"
+                f"alimiter=limit=0.95[out]"
+            ),
+            "-map", "[out]",
+            str(output_file)
+        ]
 
-    S[1:] = 1 / np.sqrt(freqs[1:])
+        result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True
+        )
 
-    pink_fft = X * S
-    pink_noise = irfft(pink_fft)
+        if result.returncode != 0:
+            print("FFmpeg command failed:")
+            print("Command:", " ".join(command))
+            print("STDOUT:", result.stdout)
+            print("STDERR:", result.stderr)
+            raise RuntimeError(f"FFmpeg failed with exit code {result.returncode}")
 
-    # Normalize the pink noise to be in the range [-1, 1]
-    pink_noise = pink_noise / np.max(np.abs(pink_noise)) 
-    return pink_noise
+        print(f"Saved mixed file: {output_file}")
 
-def generate_blue_noise(num_samples):
-    # generating blue noise using a high-pass filter on white noise
-    white_noise = np.random.normal(0, 1, num_samples)
+        mixed_files.append({
+            "file": output_file,
+            "speech_id": speech_file.stem,
+            "noise_type": noise_type,
+            "snr_db": SNR_DB,
+        })
 
-    X = rfft(white_noise)
+def normalize_text(text):
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
-    freqs = np.fft.rfftfreq(num_samples, d=1/num_samples)
-    S = np.sqrt(freqs)
+print("Loading Whisper model")
+whisper_model = whisper.load_model("small")
 
-    blue_fft = X * S
-    blue_noise = irfft(blue_fft)
 
-    blue_noise = blue_noise / np.max(np.abs(blue_noise))
-    return blue_noise
+results = []
 
-def create_noise_wav(noise_samples, filename):
-    with wave.open(f'{OUTPUT_DIR}/{filename}', "wb") as wav_file:
-        wav_file.setnchannels(1)  # mono
-        wav_file.setsampwidth(2)  # 16-bit audio
-        wav_file.setframerate(16000)  # 16kHz
-        wav_file.writeframes((noise_samples * 32767).astype(np.int16).tobytes())
+for item in mixed_files:
+    audio_file = item["file"]
+    speech_id = item["speech_id"]
 
-num_samples = 16000  # 1 second of noise at 16kHz
+    reference = speech_references[speech_id]
 
-white_noise = generate_white_noise(num_samples)
-pink_noise = generate_pink_noise(num_samples)
-blue_noise = generate_blue_noise(num_samples)
+    print(f"Transcribing: {audio_file}")
 
-# save noise samples as a wav file
-create_noise_wav(white_noise, "white_noise.wav") 
-create_noise_wav(pink_noise, "pink_noise.wav") 
-create_noise_wav(blue_noise, "blue_noise.wav")
+    # load audio as numpy array to avoid Whisper's internal ffmpeg dependency
+    sample_rate, audio_data = wavfile.read(str(audio_file))
+    audio_np = audio_data.astype(np.float32) / 32768.0
 
-# mix the synthesized sentences with noise and save the results 
+    # transcribe the audio file using Whisper
+    transcription = whisper_model.transcribe(
+        audio_np,
+        language="en",
+        fp16=False
+    )
+
+    hypothesis = transcription["text"]
+
+    # normalize both reference and hypothesis
+    reference_norm = normalize_text(reference)
+    hypothesis_norm = normalize_text(hypothesis)
+
+    wer_score = jiwer.wer(reference_norm, hypothesis_norm)
+    cer_score = jiwer.cer(reference_norm, hypothesis_norm)
+
+    results.append({
+        "file": audio_file,
+        "reference": reference,
+        "hypothesis": hypothesis,
+        "reference_norm": reference_norm,
+        "hypothesis_norm": hypothesis_norm,
+        "noise_type": item["noise_type"],
+        "snr_db": item["snr_db"],
+        "wer": wer_score,
+        "cer": cer_score,
+    })
+
+# print results
+for result in results:
+    print(f"File: {result['file']}")
+    print(f"Reference: {result['reference']}")
+    print(f"Hypothesis: {result['hypothesis']}")
+    print(f"Noise Type: {result['noise_type']}, SNR: {result['snr_db']} dB")
+    print(f"WER: {result['wer']:.3f}")
+    print(f"CER: {result['cer']:.3f}")
+    print("-" * 40)
+
