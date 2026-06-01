@@ -1,340 +1,128 @@
-import csv
-import os
-import re
-import wave
-import random
-import jiwer
-import subprocess
-import imageio_ffmpeg
 import argparse
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+import imageio_ffmpeg
 
+from dataclasses import dataclass
 from pathlib import Path
-from piper import PiperVoice, SynthesisConfig
-from scipy.fft import rfft, irfft
-from scipy.io import wavfile
-import whisper
 
-SENTENCES_COUNT = 10
-OUTPUT_DIR = Path("output")
-CHARTS_DIR = OUTPUT_DIR / "charts"
-WAV_DIR = OUTPUT_DIR / "wav"
-RESULTS_DIR = OUTPUT_DIR / "results"
-TMP_DIR = OUTPUT_DIR / "tmp"
-VOICES_DIR = Path("voices")
-DATA_DIR = Path("data")
+from piper import SynthesisConfig
 
-FFMPEG_BIN = imageio_ffmpeg.get_ffmpeg_exe() 
+from plotting import save_all_plots
+from reporting import print_results, results_to_dataframe, save_results_csv
+from speech_pipeline import (
+    load_sentences,
+    mix_with_noise,
+    synthesize_speech,
+    transcribe_and_evaluate,
+)
 
+
+SENTENCES_COUNT = 0
 NOISE_TYPES = ["white", "pink", "blue"]
 SNR_LEVELS = [0, 5, 10, 15, 20]
-
 BASE_NOISE_AMPLITUDE = 0.3
+WHISPER_MODEL_NAME = "small"
 
-def parse_args():
+
+@dataclass
+class AppConfig:
+    output_dir: Path
+    charts_dir: Path
+    wav_dir: Path
+    results_dir: Path
+    tmp_dir: Path
+    voices_dir: Path
+    data_dir: Path
+    ffmpeg_bin: str
+    selected_voices: list[str]
+
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run Piper voice synthesis, noise mixing, Whisper transcription and WER/CER evaluation."
+        description="Run Piper synthesis, noise mixing, Whisper transcription and WER/CER evaluation."
     )
-
     parser.add_argument(
         "--voices",
         nargs=2,
         required=True,
-        help="Exactly two Piper voice names without .onnx, e.g. en_US-ryan-medium en_US-amy-medium"
+        help="Exactly two Piper voice names without .onnx, e.g. en_US-ryan-medium en_US-amy-medium",
     )
-
     return parser.parse_args()
 
 
-args = parse_args()
+def build_config() -> AppConfig:
+    args = parse_args()
 
-SELECTED_VOICES = args.voices
+    output_dir = Path("output")
+    charts_dir = output_dir / "charts"
+    wav_dir = output_dir / "wav"
+    results_dir = output_dir / "results"
+    tmp_dir = output_dir / "tmp"
 
-syn_config = SynthesisConfig(
-    volume=0.5,  # half as loud
-    length_scale=1.0, 
-    #noise_scale=1.0, 
-    #noise_w_scale=1.0, 
-    #normalize_audio=False, 
-) 
+    output_dir.mkdir(exist_ok=True)
+    charts_dir.mkdir(exist_ok=True)
+    wav_dir.mkdir(exist_ok=True)
+    results_dir.mkdir(exist_ok=True)
+    tmp_dir.mkdir(exist_ok=True)
 
-# load sentences from harvard_sentences
-with open(f"{DATA_DIR}/harvard_sentences.txt", "r", encoding="utf-8") as f:
-    sentences = [line.strip() for line in f if line.strip()]
+    for file in wav_dir.glob("*.wav"):
+        file.unlink()
 
-selected_sentences = random.sample(sentences, SENTENCES_COUNT)
-
-OUTPUT_DIR.mkdir(exist_ok=True)
-CHARTS_DIR.mkdir(exist_ok=True)
-WAV_DIR.mkdir(exist_ok=True)
-RESULTS_DIR.mkdir(exist_ok=True)
-TMP_DIR.mkdir(exist_ok=True)
-
-# clear the wav directory
-for file in WAV_DIR.glob("*.wav"):
-    file.unlink()
-
-speech_items = []
-
-# load each selected voice and synthesize speech for each selected sentence
-for voice_name in SELECTED_VOICES:
-    voice_path = VOICES_DIR / f"{voice_name}.onnx"
-    if not voice_path.exists():
-        raise FileNotFoundError(f"Voice file not found: {voice_path}")
-
-    voice = PiperVoice.load(str(voice_path))
-
-    # synthesize speech for each selected sentence and save as WAV files
-    for index, sentence in enumerate(selected_sentences, start=1):
-        print(f"Synthesizing with {voice_name}: {sentence}")
-
-        filename = f"{voice_name}_speech_{index:02d}.wav"
-        filepath = WAV_DIR / filename
-
-        with wave.open(str(filepath), "wb") as wav_file:
-            voice.synthesize_wav(sentence, wav_file, syn_config=syn_config)
-
-        speech_items.append({
-            "file": filepath,
-            "speech_id": filepath.stem,
-            "voice_name": voice_name,
-            "reference": sentence,
-        }) 
-
-mixed_files = []
-
-for speech_item in speech_items:
-    speech_file = speech_item["file"]
-    for noise_type in NOISE_TYPES:
-        for snr_db in SNR_LEVELS:
-            noise_amplitude = BASE_NOISE_AMPLITUDE * (10 ** (-snr_db / 20))
-            output_file = WAV_DIR / f"{speech_file.stem}_{noise_type}_noise_snr_{snr_db}db.wav"
-
-            command = [
-                FFMPEG_BIN,
-                "-y",
-                "-i", str(speech_file),
-                "-filter_complex",
-                (
-                    f"anoisesrc=color={noise_type}:sample_rate=16000:amplitude={noise_amplitude}[noise];"
-                    f"[0:a][noise]amix=inputs=2:duration=first:dropout_transition=0,"
-                    f"alimiter=limit=0.95[out]"
-                ),
-                "-map", "[out]",
-                str(output_file)
-            ]
-
-            result = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True
-            )
-
-            if result.returncode != 0:
-                print("FFmpeg command failed:")
-                print("Command:", " ".join(command))
-                print("STDOUT:", result.stdout)
-                print("STDERR:", result.stderr)
-                raise RuntimeError(f"FFmpeg failed with exit code {result.returncode}")
-
-            print(f"Saved mixed file: {output_file}")
-
-            mixed_files.append({
-                "file": output_file,
-                "speech_id": speech_item["speech_id"],
-                "voice_name": speech_item["voice_name"],
-                "reference": speech_item["reference"],
-                "noise_type": noise_type,
-                "snr_db": snr_db,
-            })
-
-def normalize_text(text):
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9\s]", "", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-print("Loading Whisper model")
-whisper_model = whisper.load_model("small")
-
-
-results = []
-
-for item in mixed_files:
-    speech_id = item["speech_id"]
-    reference = item["reference"]
-    voice_name = item["voice_name"]
-    audio_file = item["file"]
-
-    print(f"Transcribing: {audio_file}")
-
-    # load audio as numpy array to avoid Whisper's internal ffmpeg dependency
-    sample_rate, audio_data = wavfile.read(str(audio_file))
-    audio_np = audio_data.astype(np.float32) / 32768.0
-
-    # transcribe the audio file using Whisper
-    transcription = whisper_model.transcribe(
-        audio_np,
-        language="en",
-        fp16=False
+    return AppConfig(
+        output_dir=output_dir,
+        charts_dir=charts_dir,
+        wav_dir=wav_dir,
+        results_dir=results_dir,
+        tmp_dir=tmp_dir,
+        voices_dir=Path("voices"),
+        data_dir=Path("data"),
+        ffmpeg_bin=imageio_ffmpeg.get_ffmpeg_exe(),
+        selected_voices=args.voices,
     )
 
-    hypothesis = transcription["text"]
 
-    # normalize both reference and hypothesis
-    reference_norm = normalize_text(reference)
-    hypothesis_norm = normalize_text(hypothesis)
+def main():
+    config = build_config()
+    syn_config = SynthesisConfig(
+        volume=0.5,
+        length_scale=1.0,
+    )
 
-    wer_score = jiwer.wer(reference_norm, hypothesis_norm)
-    cer_score = jiwer.cer(reference_norm, hypothesis_norm)
+    selected_sentences = load_sentences(config.data_dir, SENTENCES_COUNT)
 
-    results.append({
-        "file": audio_file,
-        "voice_name": voice_name,
-        "reference": reference,
-        "hypothesis": hypothesis,
-        "reference_norm": reference_norm,
-        "hypothesis_norm": hypothesis_norm,
-        "noise_type": item["noise_type"],
-        "snr_db": item["snr_db"],
-        "wer": wer_score,
-        "cer": cer_score,
-    })
+    speech_items = synthesize_speech(
+        selected_voices=config.selected_voices,
+        selected_sentences=selected_sentences,
+        voices_dir=config.voices_dir,
+        wav_dir=config.wav_dir,
+        syn_config=syn_config,
+    )
 
-# print results
-for result in results:
-    print(f"File: {result['file']}")
-    print(f"Reference: {result['reference']}")
-    print(f"Hypothesis: {result['hypothesis']}")
-    print(f"Noise Type: {result['noise_type']}, SNR: {result['snr_db']} dB")
-    print(f"WER: {result['wer']:.3f}")
-    print(f"CER: {result['cer']:.3f}")
-    print("-" * 40)
+    mixed_files = mix_with_noise(
+        speech_items=speech_items,
+        ffmpeg_bin=config.ffmpeg_bin,
+        wav_dir=config.wav_dir,
+        noise_types=NOISE_TYPES,
+        snr_levels=SNR_LEVELS,
+        base_noise_amplitude=BASE_NOISE_AMPLITUDE,
+    )
 
-results_csv = RESULTS_DIR / "results.csv"
+    results = transcribe_and_evaluate(
+        mixed_files=mixed_files,
+        whisper_model_name=WHISPER_MODEL_NAME,
+    )
 
-with open(results_csv, "w", newline="", encoding="utf-8") as f:
-    writer = csv.DictWriter(f, fieldnames=[
-        "file",
-        "voice_name",
-        "reference",
-        "hypothesis",
-        "reference_norm",
-        "hypothesis_norm",
-        "noise_type",
-        "snr_db",
-        "wer",
-        "cer",
-    ])
-    writer.writeheader()
-    writer.writerows(results)
+    print_results(results)
+    save_results_csv(results, config.results_dir)
 
-print(f"Saved results to {results_csv}")
-
-df = pd.DataFrame(results)
+    df = results_to_dataframe(results)
+    save_all_plots(
+        df=df,
+        selected_voices=config.selected_voices,
+        charts_dir=config.charts_dir,
+        noise_types=NOISE_TYPES,
+        snr_levels=SNR_LEVELS,
+    )
 
 
-def save_plots(df_sub, suffix, title_suffix):
-    # wer vs snr
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    for noise_type in NOISE_TYPES:
-        subset = df_sub[df_sub["noise_type"] == noise_type].groupby("snr_db")["wer"].mean()
-        ax.plot(subset.index, subset.values * 100, marker="o", label=noise_type)
-
-    ax.set_xlabel("SNR (dB)")
-    ax.set_ylabel("WER (%)")
-    ax.set_title(f"WER vs SNR by Noise Type{title_suffix}")
-    ax.set_xticks(SNR_LEVELS)
-    ax.legend()
-    ax.grid(True)
-
-    plt.tight_layout()
-    plt.savefig(CHARTS_DIR / f"wer_vs_snr{suffix}.png", dpi=150)
-    plt.close()
-
-    print(f"Saved wer_vs_snr{suffix}.png")
-
-
-    # cer vs snr
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    for noise_type in NOISE_TYPES:
-        subset = df_sub[df_sub["noise_type"] == noise_type].groupby("snr_db")["cer"].mean()
-        ax.plot(subset.index, subset.values * 100, marker="o", label=noise_type)
-
-    ax.set_xlabel("SNR (dB)")
-    ax.set_ylabel("CER (%)")
-    ax.set_title(f"CER vs SNR by Noise Type{title_suffix}")
-    ax.set_xticks(SNR_LEVELS)
-    ax.legend()
-    ax.grid(True)
-
-    plt.tight_layout()
-    plt.savefig(CHARTS_DIR / f"cer_vs_snr{suffix}.png", dpi=150)
-    plt.close()
-
-    print(f"Saved cer_vs_snr{suffix}.png")
-
-
-    # wer heatmap
-    fig, ax = plt.subplots(figsize=(8, 4))
-    pivot = df_sub.groupby(["noise_type", "snr_db"])["wer"].mean().unstack()
-    im = ax.imshow(pivot.values, aspect="auto", cmap="RdYlGn_r", vmin=0, vmax=1)
-
-    ax.set_xticks(range(len(pivot.columns)))
-    ax.set_xticklabels(pivot.columns)
-    ax.set_yticks(range(len(pivot.index)))
-    ax.set_yticklabels(pivot.index)
-    ax.set_xlabel("SNR (dB)")
-    ax.set_ylabel("Noise Type")
-    ax.set_title(f"WER Heatmap (Noise Type x SNR){title_suffix}")
-
-    for i in range(len(pivot.index)):
-        for j in range(len(pivot.columns)):
-            ax.text(j, i, f"{pivot.values[i, j]:.2f}", ha="center", va="center", fontsize=9)
-
-    plt.colorbar(im, ax=ax, label="WER")
-    plt.tight_layout()
-    plt.savefig(CHARTS_DIR / f"wer_heatmap{suffix}.png", dpi=150)
-    plt.close()
-
-    print(f"Saved wer_heatmap{suffix}.png")
-
-
-    # cer heatmap
-    fig, ax = plt.subplots(figsize=(8, 4))
-    pivot_cer = df_sub.groupby(["noise_type", "snr_db"])["cer"].mean().unstack()
-    im = ax.imshow(pivot_cer.values, aspect="auto", cmap="RdYlGn_r", vmin=0, vmax=1)
-
-    ax.set_xticks(range(len(pivot_cer.columns)))
-    ax.set_xticklabels(pivot_cer.columns)
-    ax.set_yticks(range(len(pivot_cer.index)))
-    ax.set_yticklabels(pivot_cer.index)
-    ax.set_xlabel("SNR (dB)")
-    ax.set_ylabel("Noise Type")
-    ax.set_title(f"CER Heatmap (Noise Type x SNR){title_suffix}")
-
-    for i in range(len(pivot_cer.index)):
-        for j in range(len(pivot_cer.columns)):
-            ax.text(j, i, f"{pivot_cer.values[i, j]:.2f}", ha="center", va="center", fontsize=9)
-
-    plt.colorbar(im, ax=ax, label="CER")
-    plt.tight_layout()
-    plt.savefig(CHARTS_DIR / f"cer_heatmap{suffix}.png", dpi=150)
-    plt.close()
-
-    print(f"Saved cer_heatmap{suffix}.png")
-
-
-# overall charts (all voices combined)
-save_plots(df, "", "")
-
-# per-voice charts
-for voice_name in SELECTED_VOICES:
-    df_voice = df[df["voice_name"] == voice_name]
-    safe_name = voice_name.replace("/", "_")
-    save_plots(df_voice, f"_{safe_name}", f" – {voice_name}")
+if __name__ == "__main__":
+    main()
