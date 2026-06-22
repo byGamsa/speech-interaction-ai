@@ -16,11 +16,11 @@ from speech_pipeline import (
 )
 
 
-SENTENCES_COUNT = 0
+SENTENCES_COUNT = 50
 NOISE_TYPES = ["white", "pink", "blue"]
 SNR_LEVELS = [0, 5, 10, 15, 20]
 BASE_NOISE_AMPLITUDE = 0.3
-WHISPER_MODEL_NAME = "small"
+WHISPER_MODEL_NAME = "turbo"
 
 
 @dataclass

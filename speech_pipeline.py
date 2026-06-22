@@ -108,8 +108,13 @@ def normalize_text(text):
 
 
 def transcribe_and_evaluate(mixed_files, whisper_model_name):
-    print("Loading Whisper model")
-    whisper_model = whisper.load_model(whisper_model_name)
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading Whisper model on {device}")
+    whisper_model = whisper.load_model(whisper_model_name, device=device)
+
+    use_fp16 = device == "cuda"
 
     results = []
     for item in mixed_files:
@@ -121,7 +126,7 @@ def transcribe_and_evaluate(mixed_files, whisper_model_name):
         sample_rate, audio_data = wavfile.read(str(audio_file))
         audio_np = audio_data.astype(np.float32) / 32768.0
 
-        transcription = whisper_model.transcribe(audio_np, language="en", fp16=False)
+        transcription = whisper_model.transcribe(audio_np, language="en", fp16=use_fp16)
         hypothesis = transcription["text"]
 
         reference_norm = normalize_text(reference)
