@@ -7,7 +7,7 @@ from pathlib import Path
 from piper import SynthesisConfig
 
 from plotting import save_all_plots
-from reporting import print_results, results_to_dataframe, save_results_csv
+from reporting import analyze_word_confusions, print_results, results_to_dataframe, save_results_csv
 from speech_pipeline import (
     load_sentences,
     mix_with_noise,
@@ -16,10 +16,9 @@ from speech_pipeline import (
 )
 
 
-SENTENCES_COUNT = 50
+SENTENCES_COUNT = 0
 NOISE_TYPES = ["white", "pink", "blue"]
 SNR_LEVELS = [0, 5, 10, 15, 20]
-BASE_NOISE_AMPLITUDE = 0.3
 WHISPER_MODEL_NAME = "turbo"
 
 
@@ -99,11 +98,9 @@ def main():
 
     mixed_files = mix_with_noise(
         speech_items=speech_items,
-        ffmpeg_bin=config.ffmpeg_bin,
         wav_dir=config.wav_dir,
         noise_types=NOISE_TYPES,
         snr_levels=SNR_LEVELS,
-        base_noise_amplitude=BASE_NOISE_AMPLITUDE,
     )
 
     results = transcribe_and_evaluate(
@@ -113,6 +110,7 @@ def main():
 
     print_results(results)
     save_results_csv(results, config.results_dir)
+    analyze_word_confusions(results, config.results_dir)
 
     df = results_to_dataframe(results)
     save_all_plots(

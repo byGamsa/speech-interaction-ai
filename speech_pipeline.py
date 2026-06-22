@@ -1,6 +1,5 @@
 import random
 import re
-import subprocess
 import wave
 
 import jiwer
@@ -50,39 +49,73 @@ def synthesize_speech(selected_voices, selected_sentences, voices_dir, wav_dir, 
     return speech_items
 
 
-def mix_with_noise(speech_items, ffmpeg_bin, wav_dir, noise_types, snr_levels, base_noise_amplitude):
+def generate_colored_noise(color, num_samples): 
+    # standard white noise (random values, normal distribution)
+    white_noise = np.random.randn(num_samples)
+
+    if color == "white":
+        return white_noise
+
+    # transform into frequency domain with FFT
+    frequencies = np.fft.rfftfreq(num_samples, d=1.0)
+    frequencies[0] = 1.0  # avoid division by zero
+    spectrum = np.fft.rfft(white_noise)
+
+    # shape the spectrum according to the desired noise color
+    if color == "pink":
+        spectrum = spectrum / np.sqrt(frequencies)
+    elif color == "blue":
+        spectrum = spectrum * np.sqrt(frequencies)
+
+    # transform back to time domain
+    colored_noise = np.fft.irfft(spectrum, n=num_samples)
+    return colored_noise
+
+
+def mix_with_noise(speech_items, wav_dir, noise_types, snr_levels): 
     mixed_files = []
 
     for speech_item in speech_items:
         speech_file = speech_item["file"]
+
+        # read the speech audio and convert to float in range [-1, 1]
+        sample_rate, audio_data = wavfile.read(str(speech_file))
+        speech = audio_data.astype(np.float32) / 32768.0
+
+        # calculate the average energy of the speech signal with root mean square
+        rms_speech = np.sqrt(np.mean(speech ** 2))
+
         for noise_type in noise_types:
+            # generate noise with the same length as the speech
+            noise = generate_colored_noise(noise_type, len(speech))
+
+            # measure the current RMS of the generated noise
+            rms_noise = np.sqrt(np.mean(noise ** 2))
+            if rms_noise == 0:
+                rms_noise = 1e-10  # safety check to avoid division by zero
+
             for snr_db in snr_levels:
-                noise_amplitude = base_noise_amplitude * (10 ** (-snr_db / 20))
+                # calculate the desired noise RMS based on the target SNR
+                # SNR(dB) = 20 * log10(RMS_speech / RMS_noise)
+                # => RMS_noise = RMS_speech / 10^(SNR/20)
+                desired_noise_rms = rms_speech / (10 ** (snr_db / 20))
+
+                # scale the noise so its RMS matches the desired level
+                scale_factor = desired_noise_rms / rms_noise
+                scaled_noise = noise * scale_factor
+
+                # add speech and noise together
+                mixed = speech + scaled_noise
+
+                # prevent clipping: if the signal exceeds 0.95, scale it down
+                peak = np.max(np.abs(mixed))
+                if peak > 0.95:
+                    mixed = mixed * (0.95 / peak)
+
+                # save the mixed audio as 16-bit WAV
                 output_file = wav_dir / f"{speech_file.stem}_{noise_type}_noise_snr_{snr_db}db.wav"
-
-                command = [
-                    ffmpeg_bin,
-                    "-y",
-                    "-i",
-                    str(speech_file),
-                    "-filter_complex",
-                    (
-                        f"anoisesrc=color={noise_type}:sample_rate=16000:amplitude={noise_amplitude}[noise];"
-                        f"[0:a][noise]amix=inputs=2:duration=first:dropout_transition=0,"
-                        f"alimiter=limit=0.95[out]"
-                    ),
-                    "-map",
-                    "[out]",
-                    str(output_file),
-                ]
-
-                result = subprocess.run(command, check=False, capture_output=True, text=True)
-                if result.returncode != 0:
-                    print("FFmpeg command failed:")
-                    print("Command:", " ".join(command))
-                    print("STDOUT:", result.stdout)
-                    print("STDERR:", result.stderr)
-                    raise RuntimeError(f"FFmpeg failed with exit code {result.returncode}")
+                mixed_int16 = np.clip(mixed * 32768, -32768, 32767).astype(np.int16)
+                wavfile.write(str(output_file), sample_rate, mixed_int16)
 
                 print(f"Saved mixed file: {output_file}")
 
