@@ -41,9 +41,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--voices",
-        nargs=2,
+        nargs="+",
         required=True,
-        help="Exactly two Piper voice names without .onnx, e.g. en_US-ryan-medium en_US-amy-medium",
+        help="One or more Piper voice names without .onnx, e.g. en_US-ryan-medium en_US-amy-medium",
     )
     return parser.parse_args()
 
